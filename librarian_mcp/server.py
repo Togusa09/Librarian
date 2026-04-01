@@ -12,6 +12,14 @@ from pathlib import Path
 from typing import List, Dict, Any
 import json
 import subprocess
+import base64
+import mimetypes
+import threading
+import http.server
+import socketserver
+import socket
+import urllib.parse
+import os
 
 # MCP server import (try FastMCP first)
 try:
@@ -95,7 +103,12 @@ class GameDocServer:
     def __init__(self, name: str = "GameDocServer", docs_root: str = None):
         """Create the server.
 
-        docs_root precedence: constructor arg > `DOCS_ROOT` env var > './docs'
+        Configuration precedence (per setting): constructor arg > specific env var > sensible default
+
+        - Documentation root: `docs_root` arg > `DOCUMENT_ARCHIVE_PATH` env var > './docs'
+        - Data path (for DBs, caches): `DATA_PATH` env var > './data'
+        - Bind host: `BIND_HOST` env var > '127.0.0.1'
+        - Port: `PORT` env var > 8000
         """
         import os
 
@@ -107,12 +120,27 @@ class GameDocServer:
             except Exception:
                 self.server = None
 
-        env_root = os.environ.get("DOCS_ROOT")
-        chosen = docs_root or env_root or "./docs"
+        # Paths and network configuration (exposed for Docker/compose)
+        docs_env = os.environ.get("DOCUMENT_ARCHIVE_PATH") or os.environ.get("DOCS_ROOT")
+        chosen = docs_root or docs_env or "./docs"
         self.docs_root = Path(chosen).resolve()
+
+        self.data_path = os.environ.get("DATA_PATH") or "./data"
+        # normalize to resolved Path when used
+
+        self.bind_host = os.environ.get("BIND_HOST") or "127.0.0.1"
+        try:
+            self.port = int(os.environ.get("PORT", "8000"))
+        except Exception:
+            self.port = 8000
 
         # DocIndexer will be created lazily to avoid requiring chromadb/ollama at import time
         self.indexer = None
+
+        # HTTP adapter for serving large files (started on demand)
+        self._http_server = None
+        self._http_thread = None
+        self._http_port = None
 
     # Tool implementations
     def list_files(self, directory: str = "") -> List[str]:
@@ -138,7 +166,9 @@ class GameDocServer:
         # Lazy-create indexer when first needed
         if self.indexer is None:
             try:
-                self.indexer = DocIndexer(persist_directory="./chroma_db", collection_name="game_docs", docs_root=str(self.docs_root))
+                # Place persistent DB under configured `data_path` so it can be volume-mounted
+                persist_dir = str(Path(self.data_path) / "chroma_db")
+                self.indexer = DocIndexer(persist_directory=persist_dir, collection_name="game_docs", docs_root=str(self.docs_root))
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize DocIndexer: {e}")
 
@@ -205,6 +235,136 @@ class GameDocServer:
 
         raise ValueError("Unknown scope. Must be one of: 'file', 'directory', 'snippet'")
 
+    def read_binary(self, file_path: str, max_inline_bytes: int = 5 * 1024 * 1024) -> Dict[str, Any]:
+        """Return binary content for `file_path`.
+
+        - If the file is smaller than `max_inline_bytes`, return a base64 payload:
+            {"method": "inline", "content_type": "image/png", "data_b64": "...", "size": 123}
+
+        - If larger, ensure the HTTP adapter is running and return a URL:
+            {"method": "http", "url": "http://host:port/rel/path", "content_type": "...", "size": 123}
+
+        This avoids sending huge blobs over MCP while still providing a fallback.
+        """
+        p = _resolve_within_root(self.docs_root, file_path)
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        size = p.stat().st_size
+        content_type = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+
+        if size <= max_inline_bytes:
+            data = p.read_bytes()
+            b64 = base64.b64encode(data).decode("ascii")
+            return {"method": "inline", "content_type": content_type, "data_b64": b64, "size": size}
+
+        # Otherwise, provide an HTTP URL via the adapter
+        url = self._ensure_http_adapter_and_url(str(p.relative_to(self.docs_root)))
+        return {"method": "http", "url": url, "content_type": content_type, "size": size}
+
+    def _ensure_http_adapter_and_url(self, rel_path: str) -> str:
+        """Start the HTTP adapter if needed and return a URL for `rel_path` (relative to docs_root)."""
+        # Start server if not running
+        if self._http_server is None:
+            # Create a request handler that only serves files under docs_root
+            docs_root = str(self.docs_root)
+
+            class _Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self_inner):
+                    parsed = urllib.parse.urlparse(self_inner.path)
+                    rel = urllib.parse.unquote(parsed.path).lstrip("/")
+                    target = Path(docs_root) / rel
+                    try:
+                        target_resolved = target.resolve()
+                    except Exception:
+                        self_inner.send_error(404)
+                        return
+
+                    # Ensure containment
+                    root_resolved = Path(docs_root).resolve()
+                    try:
+                        if hasattr(target_resolved, "is_relative_to"):
+                            if not target_resolved.is_relative_to(root_resolved):
+                                self_inner.send_error(403)
+                                return
+                        else:
+                            if os.path.commonpath([str(root_resolved)]) != os.path.commonpath([str(root_resolved), str(target_resolved)]):
+                                self_inner.send_error(403)
+                                return
+                    except Exception:
+                        self_inner.send_error(403)
+                        return
+
+                    if not target_resolved.exists() or not target_resolved.is_file():
+                        self_inner.send_error(404)
+                        return
+
+                    # Serve file
+                    try:
+                        content_type = mimetypes.guess_type(str(target_resolved))[0] or "application/octet-stream"
+                        self_inner.send_response(200)
+                        self_inner.send_header("Content-Type", content_type)
+                        self_inner.send_header("Content-Length", str(target_resolved.stat().st_size))
+                        self_inner.end_headers()
+                        with open(target_resolved, "rb") as fh:
+                            shutil_copyfileobj(fh, self_inner.wfile)
+                    except Exception:
+                        self_inner.send_error(500)
+
+                def log_message(self_inner, format, *args):
+                    # Silence default logging; keep noisy output out of server logs
+                    return
+
+            # Helper to copy file-like objects in chunks without importing shutil in many places
+            def shutil_copyfileobj(fsrc, fdst, length=16 * 1024):
+                while True:
+                    buf = fsrc.read(length)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+
+            # Bind to an ephemeral port on configured host
+            class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+                daemon_threads = True
+
+            # Try to bind; allow the OS to pick an available port (port 0)
+            server = None
+            for attempt in range(3):
+                try:
+                    srv = _ThreadingHTTPServer((self.bind_host, 0), _Handler)
+                    server = srv
+                    break
+                except OSError:
+                    # Try again briefly
+                    continue
+
+            if server is None:
+                raise RuntimeError("Failed to start HTTP adapter for serving files")
+
+            # Save and run in background thread
+            self._http_server = server
+            self._http_port = server.server_address[1]
+
+            def _serve():
+                try:
+                    server.serve_forever()
+                finally:
+                    try:
+                        server.server_close()
+                    except Exception:
+                        pass
+
+            t = threading.Thread(target=_serve, daemon=True)
+            t.start()
+            self._http_thread = t
+
+        # Construct URL for the relative path
+        host = self.bind_host
+        port = self._http_port
+        # Ensure rel_path does not start with a slash
+        rel_path_clean = rel_path.lstrip("/")
+        return f"http://{host}:{port}/{urllib.parse.quote(rel_path_clean)}"
+
     # Registration helper for FastMCP-compatible servers
     def register_tools(self):
         if self.server is None:
@@ -217,17 +377,21 @@ class GameDocServer:
             self.server.register_tool("read_document", self.read_document)
             self.server.register_tool("search_knowledge_base", self.search_knowledge_base)
             self.server.register_tool("summarize_context", self.summarize_context)
+            # Image/binary support (inline base64 or HTTP fallback)
+            self.server.register_tool("read_binary", self.read_binary)
         elif hasattr(self.server, "add_tool"):
             self.server.add_tool("list_files", self.list_files)
             self.server.add_tool("read_document", self.read_document)
             self.server.add_tool("search_knowledge_base", self.search_knowledge_base)
             self.server.add_tool("summarize_context", self.summarize_context)
+            self.server.add_tool("read_binary", self.read_binary)
         else:
             # Best-effort: attach as attributes
             setattr(self.server, "list_files", self.list_files)
             setattr(self.server, "read_document", self.read_document)
             setattr(self.server, "search_knowledge_base", self.search_knowledge_base)
             setattr(self.server, "summarize_context", self.summarize_context)
+            setattr(self.server, "read_binary", self.read_binary)
 
 
 async def start_server():
@@ -235,21 +399,83 @@ async def start_server():
     svc.register_tools()
     print("GameDocServer initialized. Tools registered.")
 
-    if svc.server is not None and hasattr(svc.server, "start"):
-        # If FastMCP exposes an async start, call it
-        maybe = svc.server.start()
-        if asyncio.iscoroutine(maybe):
-            await maybe
-    else:
-        # Keep the process alive to allow interactive use via imported instance
-        print("Server running in local mode. Use the GameDocServer instance to call tools.")
-        while True:
-            await asyncio.sleep(3600)
-
-
-def main():
-    asyncio.run(start_server())
-
 
 if __name__ == "__main__":
-    main()
+    # Provide a small, non-sensitive discovery payload at the base URL so humans
+    # and MCP-capable clients can discover the service without guessing routes.
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+    class _RootHandler(BaseHTTPRequestHandler):
+        def _send_json(self, data, status=200):
+            payload = json.dumps(data, indent=2).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            # Allow simple browser checks from local pages
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/":
+                manifest = {
+                    "name": "librarian_mcp",
+                    "version": "0.1.0",
+                    "description": "Lightweight MCP server for document lookup",
+                    "endpoints": {
+                        "manifest": " /.well-known/mcp.json",
+                        "health": "/healthz",
+                        "tools": "/tools"
+                    },
+                    "tools": ["list_files", "read_document", "search_knowledge_base", "read_binary"]
+                }
+                self._send_json(manifest)
+                return
+
+            if path == "/.well-known/mcp.json":
+                # Minimal MCP-style manifest (non-sensitive)
+                mcp_manifest = {
+                    "name": "librarian_mcp",
+                    "host": self.server.server_address[0],
+                    "port": self.server.server_address[1],
+                    "tls": False,
+                    "tools": [
+                        {"name": "list_files", "description": "List files under docs root"},
+                        {"name": "read_document", "description": "Return document text"},
+                        {"name": "search_knowledge_base", "description": "Semantic search for docs"},
+                        {"name": "read_binary", "description": "Return binary (inline base64 or HTTP fallback)"}
+                    ]
+                }
+                self._send_json(mcp_manifest)
+                return
+
+            if path == "/healthz":
+                self._send_json({"status": "ok"})
+                return
+
+            # Default: 404
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    host = os.environ.get("BIND_HOST") or "127.0.0.1"
+    try:
+        port = int(os.environ.get("PORT", "8000"))
+    except Exception:
+        port = 8000
+
+    server = ThreadingHTTPServer((host, port), _RootHandler)
+    print(f"Serving discovery endpoints on http://{host}:{port}/")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Shutting down")
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+    # End of module when running as a discovery HTTP server.

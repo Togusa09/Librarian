@@ -39,3 +39,98 @@ Tests
 python -m pip install -r requirements.txt
 pytest -q
 ```
+
+Docker
+
+Build the image (from repository root):
+
+```bash
+docker build -t librarian_mcp:latest .
+```
+
+Run with local directories mounted for persistence:
+
+```bash
+docker run --rm -it \
+	-e DOCUMENT_ARCHIVE_PATH=/docs \
+	-e DATA_PATH=/data \
+	-e BIND_HOST=0.0.0.0 \
+	-e PORT=8000 \
+	-v $(pwd)/docs:/docs \
+	-v $(pwd)/data:/data \
+	-p 8000:8000 \
+	librarian_mcp:latest
+```
+
+Or use the included `docker-compose.yml` example from the repository root:
+
+```bash
+docker-compose up --build
+```
+
+Notes
+- The container exposes `DOCUMENT_ARCHIVE_PATH` and `DATA_PATH` for mapping your document archive and persistent DB/cache files.
+- The server will create the directories at container startup if they do not already exist.
+
+**GitHub Copilot MCP Config**
+
+You can provide a small MCP configuration file to help GitHub Copilot (or other MCP-capable clients) discover the server and available tools. Save the example below as `copilot-mcp.json` in the repository root and adapt `host`/`port` as needed.
+
+```json
+{
+	"name": "librarian_mcp",
+	"host": "127.0.0.1",
+	"port": 8000,
+	"tls": false,
+	"tools": [
+		{ "name": "list_files", "description": "List files under docs root" },
+		{ "name": "read_document", "description": "Return document text" },
+		{ "name": "search_knowledge_base", "description": "Semantic search for docs" },
+		{ "name": "read_binary", "description": "Return binary (inline base64 or HTTP fallback)" }
+	]
+}
+```
+
+How to use
+
+- Place `copilot-mcp.json` in your project and follow GitHub Copilot/extension docs to point the extension at the MCP server or config file. The exact integration steps depend on the Copilot build and your editor — consult Copilot documentation for "MCP" or "Model Context Protocol" for details.
+
+
+Update image locally
+
+Rebuild the local image after code changes from the repository root:
+
+```bash
+docker build -t librarian_mcp:latest .
+```
+
+If you prefer to tag with a version:
+
+```bash
+docker build -t librarian_mcp:0.1.0 .
+```
+
+Create container based on image
+
+Run a container mapping your document archive and a host data directory for persistent DB/cache files:
+
+```bash
+docker run -d --name librarian_mcp \
+	-e DOCUMENT_ARCHIVE_PATH=/docs \
+	-e DATA_PATH=/data \
+	-e BIND_HOST=0.0.0.0 \
+	-e PORT=8000 \
+	-v $(pwd)/docs:/docs \
+	-v $(pwd)/data:/data \
+	-p 8000:8000 \
+	librarian_mcp:latest
+```
+
+Stop and remove the container:
+
+```bash
+docker stop librarian_mcp
+docker rm librarian_mcp
+```
+
+Use `docker logs librarian_mcp` to inspect startup output and verify the server created the mapped directories.
