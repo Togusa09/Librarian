@@ -1,0 +1,1 @@
+The librarian server uses chroma for vector search.

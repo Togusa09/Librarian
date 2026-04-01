@@ -1,0 +1,95 @@
+{
+  "doc_used": "Technical/blender-export-standard.md",
+  "bin_used": "Vault/SpaceVault/Gemini_Generated_Image_qc33ncqc33ncqc33.png",
+  "results": [
+    {
+      "step": "healthz",
+      "status": "PASS",
+      "ms": 108,
+      "detail": "ok"
+    },
+    {
+      "step": "discovery",
+      "status": "PASS",
+      "ms": 13,
+      "detail": "ok"
+    },
+    {
+      "step": "tools",
+      "status": "PASS",
+      "ms": 6,
+      "detail": "ok"
+    },
+    {
+      "step": "tool:list_files",
+      "status": "PASS",
+      "ms": 331,
+      "detail": "ok"
+    },
+    {
+      "step": "tool:read_document",
+      "status": "PASS",
+      "ms": 47,
+      "detail": "ok"
+    },
+    {
+      "step": "tool:search_knowledge_base",
+      "status": "PASS",
+      "ms": 15070,
+      "detail": "ok"
+    },
+    {
+      "step": "tool:read_binary",
+      "status": "PASS",
+      "ms": 466,
+      "detail": "ok"
+    },
+    {
+      "step": "tool:summarize_context(timeout=30s)",
+      "status": "FAIL",
+      "ms": 30050,
+      "detail": "The request was canceled due to the configured HttpClient.Timeout of 30 seconds elapsing."
+    },
+    {
+      "step": "tool:summarize_context(timeout=60s)",
+      "status": "FAIL",
+      "ms": 60006,
+      "detail": "The request was canceled due to the configured HttpClient.Timeout of 60 seconds elapsing."
+    },
+    {
+      "step": "tool:summarize_context(timeout=120s)",
+      "status": "FAIL",
+      "ms": 120006,
+      "detail": "The request was canceled due to the configured HttpClient.Timeout of 120 seconds elapsing."
+    },
+    {
+      "step": "tool:summarize_context(timeout=240s)",
+      "status": "PASS",
+      "ms": 111633,
+      "detail": "ok"
+    },
+    {
+      "step": "tool:summarize_context:warm_run_1",
+      "status": "PASS",
+      "ms": 28930,
+      "detail": "ok"
+    },
+    {
+      "step": "tool:summarize_context:warm_run_2",
+      "status": "PASS",
+      "ms": 63978,
+      "detail": "ok"
+    },
+    {
+      "step": "tool:summarize_context:warm_run_3",
+      "status": "PASS",
+      "ms": 56409,
+      "detail": "ok"
+    }
+  ],
+  "warm_stats": {
+    "min_ms": 28930.0,
+    "avg_ms": 49772,
+    "max_ms": 63978.0
+  }
+}

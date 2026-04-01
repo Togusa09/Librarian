@@ -1,4 +1,7 @@
-Librarian MCP Server (scaffold)
+Librarian MCP Server 
+
+Experiment at making an MCP server for document archive access and RAG workflows, using `chromadb` for vector storage, `ollama` for LLM interactions and Sqlite for metadata caching. 
+It's a fairly simple starting point, and really makes you appreciate how much work a production-ready documentation assistant entails.
 
 Quick start
 
@@ -56,6 +59,11 @@ docker run --rm -it \
 	-e DATA_PATH=/data \
 	-e BIND_HOST=0.0.0.0 \
 	-e PORT=8000 \
+	-e OLLAMA_HOST=http://host.docker.internal:11434 \
+	-e OLLAMA_MODEL=llama3 \
+	-e OLLAMA_KEEP_ALIVE=30m \
+	-e OLLAMA_PREWARM=1 \
+	-e OLLAMA_PREWARM_TIMEOUT_SEC=12 \
 	-v $(pwd)/docs:/docs \
 	-v $(pwd)/data:/data \
 	-p 8000:8000 \
@@ -70,6 +78,9 @@ docker-compose up --build
 
 Notes
 - The container exposes `DOCUMENT_ARCHIVE_PATH` and `DATA_PATH` for mapping your document archive and persistent DB/cache files.
+- Set `OLLAMA_HOST` to a reachable Ollama endpoint for `summarize_context` and Ollama-backed workflows. On Docker Desktop, `http://host.docker.internal:11434` points to Ollama running on the host.
+- `OLLAMA_PREWARM=1` triggers a background warmup call on startup; tune timeout with `OLLAMA_PREWARM_TIMEOUT_SEC`.
+- `OLLAMA_KEEP_ALIVE` keeps the model resident between requests to reduce cold-start latency.
 - The server will create the directories at container startup if they do not already exist.
 
 **GitHub Copilot MCP Config**
@@ -175,6 +186,11 @@ docker run -d --name librarian_mcp \
 	-e DATA_PATH=/data \
 	-e BIND_HOST=0.0.0.0 \
 	-e PORT=8000 \
+	-e OLLAMA_HOST=http://host.docker.internal:11434 \
+	-e OLLAMA_MODEL=llama3 \
+	-e OLLAMA_KEEP_ALIVE=30m \
+	-e OLLAMA_PREWARM=1 \
+	-e OLLAMA_PREWARM_TIMEOUT_SEC=12 \
 	-v $(pwd)/docs:/docs \
 	-v $(pwd)/data:/data \
 	-p 8000:8000 \

@@ -37,10 +37,12 @@ def test_list_and_read_files_use_relative_paths(tmp_path):
 
     svc = server.GameDocServer(docs_root=str(root))
 
-    files = svc.list_files("")
+    res = svc.list_files("")
+    files = res.get("files") if isinstance(res, dict) else res
+    paths = [f.get("path") if isinstance(f, dict) else f for f in files]
     # Should return relative paths
-    assert "one.md" in files
-    assert str(Path("sub") / "two.txt") in files
+    assert "one.md" in paths
+    assert str(Path("sub") / "two.txt") in paths
 
     content = svc.read_document("one.md")
     assert "content one" in content

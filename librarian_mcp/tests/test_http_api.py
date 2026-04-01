@@ -53,7 +53,9 @@ def test_list_and_read_and_read_binary(tmp_path):
     with urllib.request.urlopen(req, data=json.dumps({"path": ""}).encode("utf-8")) as r:
         body = json.load(r)
     files = body.get("result", {}).get("files", [])
-    assert "one.md" in files
+    # files now contain metadata objects; check that our file appears by path
+    paths = [f.get("path") if isinstance(f, dict) else f for f in files]
+    assert "one.md" in paths
 
     # read_document
     req = urllib.request.Request(f"{base}/tools/read_document", method="POST")
