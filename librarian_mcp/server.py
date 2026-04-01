@@ -27,6 +27,7 @@ import json as _json
 import uuid
 import logging
 import hashlib
+import math
 import time
 from collections import OrderedDict
 
@@ -946,36 +947,17 @@ class GameDocServer:
             raise FileNotFoundError(f"File not found: {file_path}")
         return p.read_text(encoding="utf-8", errors="ignore")
 
-    def search_knowledge_base(self, query: str, n: int = 5) -> List[Dict[str, Any]]:
-        # Lazy-create indexer when first needed. If DocIndexer fails to initialize
-        # (migration issues, chroma compatibility, etc.) fall back to a simple
-        # in-process in-memory search using deterministic embeddings.
-        if self.indexer is None:
-            try:
-                # Place persistent DB under configured `data_path` so it can be volume-mounted
-                persist_dir = str(Path(self.data_path) / "chroma_db")
-                self.indexer = DocIndexer(persist_directory=persist_dir, collection_name="game_docs", docs_root=str(self.docs_root))
-            except Exception as e:
-                # Log and continue with in-memory fallback
-                logging.getLogger("GameDocServer").warning("DocIndexer init failed, using in-memory fallback: %s", e)
-                self.indexer = None
+    def _search_placeholder_deterministic(self, query: str, n: int = 5) -> List[Dict[str, Any]]:
+        """Deterministic placeholder fallback search.
 
-        if self.indexer is not None:
-            try:
-                return self.indexer.semantic_search(query, n=n)
-            except Exception as e:
-                logging.getLogger("GameDocServer").exception("DocIndexer.semantic_search failed, falling back to in-memory: %s", e)
-                # Clear indexer so subsequent calls will rebuild or stay in fallback
-                self.indexer = None
-
-        # In-memory fallback: scan docs, chunk, compute deterministic SHA-256 based
-        # embeddings and return top-n by cosine similarity.
-        import hashlib, math
+        This fallback does not provide semantic retrieval quality. It uses stable
+        hash-derived vectors to keep results deterministic in zero-dependency mode
+        when the primary indexer is unavailable.
+        """
 
         def embed(text: str) -> List[float]:
             h = hashlib.sha256(text.encode("utf-8")).digest()
             return [float(h[i % len(h)]) / 255.0 for i in range(768)]
-
 
         def cosine(a: List[float], b: List[float]) -> float:
             sa = sum(x * x for x in a)
@@ -996,7 +978,6 @@ class GameDocServer:
                 text = file.read_text(encoding="utf-8", errors="ignore")
             except Exception:
                 continue
-            # chunk text similarly to DocIndexer
             CHUNK_SIZE = 1000
             OVERLAP = max(int(CHUNK_SIZE * 0.1), 1)
             step = max(CHUNK_SIZE - OVERLAP, 1)
@@ -1013,6 +994,45 @@ class GameDocServer:
         for c in candidates[:n]:
             out.append({"document": c["document"], "metadata": c["metadata"], "distance": 1.0 - c["score"]})
         return out
+
+    def _normalize_search_results(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for r in rows:
+            md = r.get("metadata") or {}
+            src = md.get("source") or md.get("path") or None
+            snippet = r.get("document")
+            normalized.append({"path": src, "score": r.get("distance"), "snippet": snippet, "metadata": md})
+        return normalized
+
+    def search_knowledge_base(self, query: str, n: int = 5) -> List[Dict[str, Any]]:
+        # Lazy-create indexer when first needed. If DocIndexer fails to initialize
+        # (migration issues, chroma compatibility, etc.) fall back to a simple
+        # in-process deterministic placeholder search.
+        if self.indexer is None:
+            try:
+                # Place persistent DB under configured `data_path` so it can be volume-mounted
+                persist_dir = str(Path(self.data_path) / "chroma_db")
+                self.indexer = DocIndexer(persist_directory=persist_dir, collection_name="game_docs", docs_root=str(self.docs_root))
+            except Exception as e:
+                # Log and continue with deterministic placeholder fallback.
+                logging.getLogger("GameDocServer").warning(
+                    "DocIndexer init failed, using deterministic placeholder fallback: %s",
+                    e,
+                )
+                self.indexer = None
+
+        if self.indexer is not None:
+            try:
+                return self.indexer.semantic_search(query, n=n)
+            except Exception as e:
+                logging.getLogger("GameDocServer").exception(
+                    "DocIndexer.semantic_search failed, using deterministic placeholder fallback: %s",
+                    e,
+                )
+                # Clear indexer so subsequent calls will rebuild or stay in fallback
+                self.indexer = None
+
+        return self._search_placeholder_deterministic(query, n=n)
 
     def summarize_context(self, scope: str, target: str, depth: str = None) -> str:
         """Summarize content according to `scope`:
@@ -1336,62 +1356,8 @@ class GameDocServer:
                         top_k = int(payload.get("top_k", payload.get("n", 5)))
                         if not q:
                             raise ValueError("missing q")
-
-                        # Call search with a protective wrapper: if DocIndexer or chroma
-                        # raises at any point, fall back to deterministic in-memory search
-                        try:
-                            res = self.search_knowledge_base(q, n=top_k)
-                        except Exception:
-                            # Fallback: deterministic SHA-256 embeddings + cosine similarity
-                            import hashlib, math
-
-                            def embed(text: str):
-                                h = hashlib.sha256(text.encode("utf-8")).digest()
-                                return [float(h[i % len(h)]) / 255.0 for i in range(768)]
-
-
-                            def cosine(a, b):
-                                sa = sum(x * x for x in a)
-                                sb = sum(x * x for x in b)
-                                if sa == 0 or sb == 0:
-                                    return 0.0
-                                dot = sum(x * y for x, y in zip(a, b))
-                                return dot / (math.sqrt(sa) * math.sqrt(sb))
-
-                            q_emb = embed(q)
-                            candidates = []
-                            for file in Path(self.docs_root).rglob("*"):
-                                if not file.is_file():
-                                    continue
-                                if file.suffix.lower() not in (".md", ".txt"):
-                                    continue
-                                try:
-                                    text = file.read_text(encoding="utf-8", errors="ignore")
-                                except Exception:
-                                    continue
-                                CHUNK_SIZE = 1000
-                                OVERLAP = max(int(CHUNK_SIZE * 0.1), 1)
-                                step = max(CHUNK_SIZE - OVERLAP, 1)
-                                for i in range(0, len(text), step):
-                                    chunk = text[i:i + CHUNK_SIZE]
-                                    if not chunk:
-                                        continue
-                                    emb = embed(chunk)
-                                    score = cosine(q_emb, emb)
-                                    candidates.append({"score": score, "document": chunk, "metadata": {"source": str(file), "offset": i}})
-
-                            candidates.sort(key=lambda c: c["score"], reverse=True)
-                            res = []
-                            for c in candidates[:top_k]:
-                                res.append({"document": c["document"], "metadata": c["metadata"], "distance": 1.0 - c["score"]})
-                        # Normalize results to include path/title/snippet when possible
-                        normalized = []
-                        for r in res:
-                            md = r.get("metadata") or {}
-                            src = md.get("source") or md.get("path") or None
-                            snippet = r.get("document")
-                            normalized.append({"path": src, "score": r.get("distance"), "snippet": snippet, "metadata": md})
-                        result = {"results": normalized}
+                        res = self.search_knowledge_base(q, n=top_k)
+                        result = {"results": self._normalize_search_results(res)}
 
                     elif tool_name == "read_binary":
                         fp = payload.get("path") or payload.get("file_path") or payload.get("file")
@@ -1438,66 +1404,6 @@ class GameDocServer:
                     self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
                 except Exception as e:
                     logger.exception("Tool invocation failed")
-                    # If search failed due to indexer/migration issues, attempt an in-memory
-                    # deterministic-embedding fallback here so callers don't get a 500.
-                    if tool_name == "search_knowledge_base":
-                        try:
-                            q = payload.get("q") or payload.get("query")
-                            top_k = int(payload.get("top_k", payload.get("n", 5)))
-                            if not q:
-                                raise ValueError("missing q")
-
-                            # In-memory fallback: deterministic SHA-256 embeddings + cosine similarity
-                            import hashlib, math
-
-                            def embed(text: str):
-                                h = hashlib.sha256(text.encode("utf-8")).digest()
-                                return [float(h[i % len(h)]) / 255.0 for i in range(768)]
-
-
-                            def cosine(a, b):
-                                sa = sum(x * x for x in a)
-                                sb = sum(x * x for x in b)
-                                if sa == 0 or sb == 0:
-                                    return 0.0
-                                dot = sum(x * y for x, y in zip(a, b))
-                                return dot / (math.sqrt(sa) * math.sqrt(sb))
-
-                            q_emb = embed(q)
-                            candidates = []
-                            for file in Path(self.docs_root).rglob("*"):
-                                if not file.is_file():
-                                    continue
-                                if file.suffix.lower() not in (".md", ".txt"):
-                                    continue
-                                try:
-                                    text = file.read_text(encoding="utf-8", errors="ignore")
-                                except Exception:
-                                    continue
-                                CHUNK_SIZE = 1000
-                                OVERLAP = max(int(CHUNK_SIZE * 0.1), 1)
-                                step = max(CHUNK_SIZE - OVERLAP, 1)
-                                for i in range(0, len(text), step):
-                                    chunk = text[i:i + CHUNK_SIZE]
-                                    if not chunk:
-                                        continue
-                                    emb = embed(chunk)
-                                    score = cosine(q_emb, emb)
-                                    candidates.append({"score": score, "document": chunk, "metadata": {"source": str(file), "offset": i}})
-
-                            candidates.sort(key=lambda c: c["score"], reverse=True)
-                            out = []
-                            for c in candidates[:top_k]:
-                                out.append({"path": c["metadata"].get("source"), "score": 1.0 - c["score"], "snippet": c["document"], "metadata": c["metadata"]})
-
-                            body = {"request_id": req_id, "result": {"results": out}}
-                            self_inner._set_cors_headers(200)
-                            self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                            return
-                        except Exception:
-                            # Fall through to returning the original error below
-                            pass
-
                     body = {"error": "internal", "message": str(e), "request_id": req_id}
                     self_inner._set_cors_headers(500)
                     self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
