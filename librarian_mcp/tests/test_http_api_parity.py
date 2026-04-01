@@ -1,3 +1,4 @@
+import asyncio
 import json
 import urllib.error
 import urllib.request
@@ -5,6 +6,10 @@ import urllib.request
 import pytest
 
 from librarian_mcp import server
+
+
+def _run(coro):
+    return asyncio.run(coro)
 
 
 def _post_json(base, tool_name, payload):
@@ -21,29 +26,17 @@ def _post_raw(base, tool_name, raw_bytes):
         return r.status, dict(r.headers), json.load(r)
 
 
-def _start_api(svc, impl):
-    svc.start_http_api(host="127.0.0.1", port=0, impl=impl)
+def _start_api(svc):
+    svc.start_http_api(host="127.0.0.1", port=0)
     port = svc._api_server.server_address[1]
     return f"http://127.0.0.1:{port}"
 
 
-def _impls_available():
-    impls = ["legacy"]
-    if getattr(server, "FASTAPI_AVAILABLE", False):
-        impls.append("fastapi")
-    return impls
-
-
-@pytest.fixture(params=_impls_available())
-def api_impl(request):
-    return request.param
-
-
-def test_get_routes_parity(api_impl, tmp_path):
+def test_get_routes_parity(tmp_path):
     root = tmp_path / "docs"
     root.mkdir()
     svc = server.GameDocServer(docs_root=str(root))
-    base = _start_api(svc, api_impl)
+    base = _start_api(svc)
 
     try:
         for path in ["/.well-known/mcp.json", "/healthz", "/readyz", "/tools", "/cache_status"]:
@@ -55,14 +48,14 @@ def test_get_routes_parity(api_impl, tmp_path):
                 if path != "/tools":
                     assert "request_id" in body or path == "/.well-known/mcp.json"
     finally:
-        svc.shutdown()
+        _run(svc.shutdown())
 
 
-def test_options_and_head_parity(api_impl, tmp_path):
+def test_options_and_head_parity(tmp_path):
     root = tmp_path / "docs"
     root.mkdir()
     svc = server.GameDocServer(docs_root=str(root))
-    base = _start_api(svc, api_impl)
+    base = _start_api(svc)
 
     try:
         req_options = urllib.request.Request(f"{base}/tools/list_files", method="OPTIONS")
@@ -75,14 +68,14 @@ def test_options_and_head_parity(api_impl, tmp_path):
             assert r.status == 200
             assert "application/json" in r.headers.get("Content-Type", "")
     finally:
-        svc.shutdown()
+        _run(svc.shutdown())
 
 
-def test_error_shape_parity(api_impl, tmp_path):
+def test_error_shape_parity(tmp_path):
     root = tmp_path / "docs"
     root.mkdir()
     svc = server.GameDocServer(docs_root=str(root))
-    base = _start_api(svc, api_impl)
+    base = _start_api(svc)
 
     try:
         req = urllib.request.Request(f"{base}/tools/unknown_tool", method="POST")
@@ -115,16 +108,16 @@ def test_error_shape_parity(api_impl, tmp_path):
         assert body.get("error") == "bad_request"
         assert "request_id" in body
     finally:
-        svc.shutdown()
+        _run(svc.shutdown())
 
 
-def test_search_alias_parity(api_impl, tmp_path):
+def test_search_alias_parity(tmp_path):
     root = tmp_path / "docs"
     root.mkdir()
     (root / "one.md").write_text("alpha beta gamma")
 
     svc = server.GameDocServer(docs_root=str(root))
-    base = _start_api(svc, api_impl)
+    base = _start_api(svc)
 
     try:
         status, _headers, body_q = _post_json(base, "search_knowledge_base", {"q": "alpha", "top_k": 1})
@@ -137,4 +130,4 @@ def test_search_alias_parity(api_impl, tmp_path):
         assert "request_id" in body_query
         assert isinstance(body_query.get("result", {}).get("results"), list)
     finally:
-        svc.shutdown()
+        _run(svc.shutdown())

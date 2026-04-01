@@ -1,9 +1,17 @@
+import asyncio
 import json
 import urllib.request
 import urllib.error
 from pathlib import Path
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from librarian_mcp import server
+
+
+def _run(coro):
+    return asyncio.run(coro)
 
 
 def _start_api(svc):
@@ -38,8 +46,7 @@ def test_discovery_and_health(tmp_path):
     assert body.get("status") == "ok"
 
     # shutdown
-    svc._api_server.shutdown()
-    svc._api_server.server_close()
+    _run(svc.shutdown())
 
 
 def test_list_and_read_and_read_binary(tmp_path):
@@ -81,8 +88,7 @@ def test_list_and_read_and_read_binary(tmp_path):
     assert "data_b64" in res
 
     # shutdown
-    svc._api_server.shutdown()
-    svc._api_server.server_close()
+    _run(svc.shutdown())
 
 
 def test_summarize_context_uses_http_memory_cache(monkeypatch, tmp_path):
@@ -116,7 +122,7 @@ def test_summarize_context_uses_http_memory_cache(monkeypatch, tmp_path):
         assert status["cache_hits_mem"] == 1
         assert status["cache_misses"] == 1
     finally:
-        svc.shutdown()
+        _run(svc.shutdown())
 
 
 def test_summarize_context_uses_http_sqlite_cache_across_instances(monkeypatch, tmp_path):
@@ -143,7 +149,7 @@ def test_summarize_context_uses_http_sqlite_cache_across_instances(monkeypatch, 
         assert body["result"]["summary"] == "http-persisted-summary"
         assert calls["count"] == 1
     finally:
-        svc1.shutdown()
+        _run(svc1.shutdown())
 
     def should_not_run(model, prompt, keep_alive=None):
         raise AssertionError("LLM should not run when summarize_context is served from sqlite cache")
@@ -160,4 +166,38 @@ def test_summarize_context_uses_http_sqlite_cache_across_instances(monkeypatch, 
         assert status["cache_hits_sqlite"] == 1
         assert status["cache_computes"] == 0
     finally:
-        svc2.shutdown()
+        _run(svc2.shutdown())
+
+
+def test_summarize_context_dedupes_concurrent_http_requests(monkeypatch, tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "one.md").write_text("concurrent http cache test\n" * 12)
+    data_path = tmp_path / "data"
+    monkeypatch.setenv("DATA_PATH", str(data_path))
+    monkeypatch.setattr(server.GameDocServer, "_start_ollama_prewarm", lambda self: None)
+    monkeypatch.setattr(server.GameDocServer, "_start_summary_background", lambda self: None)
+
+    calls = {"count": 0}
+    lock = threading.Lock()
+
+    def fake_generate(model, prompt, keep_alive=None):
+        with lock:
+            calls["count"] += 1
+        time.sleep(0.2)
+        return "http-shared-summary"
+
+    monkeypatch.setattr(server, "_call_ollama_generate", fake_generate)
+
+    svc = server.GameDocServer(docs_root=str(root))
+    base = _start_api(svc)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            a = pool.submit(_post_json, base, "summarize_context", {"scope": "file", "target": "one.md", "depth": "concise"})
+            b = pool.submit(_post_json, base, "summarize_context", {"scope": "file", "target": "one.md", "depth": "concise"})
+
+        assert a.result()["result"]["summary"] == "http-shared-summary"
+        assert b.result()["result"]["summary"] == "http-shared-summary"
+        assert calls["count"] == 1
+    finally:
+        _run(svc.shutdown())

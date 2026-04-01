@@ -10,13 +10,13 @@ This file contains simple startup skeletons and TODOs for MCP handlers.
 import asyncio
 from pathlib import Path
 from typing import List, Dict, Any
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import subprocess
 import sqlite3
 import base64
 import mimetypes
 import threading
-import queue
 import http.server
 import socketserver
 import socket
@@ -270,20 +270,23 @@ class GameDocServer:
 
         self._summary_cache_lock = threading.RLock()
         self._summary_mem_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
-        self._summary_inflight: Dict[str, threading.Event] = {}
+        self._summary_inflight: Dict[str, Future] = {}
 
         # Phase 2: persisted SQLite summary store.
         self._data_root = Path(self.data_path).resolve()
         self._summary_store_path = self._data_root / "summary_cache.sqlite3"
 
-        # Queue + workers for pre-caching and refresh-on-edit.
-        self._summary_task_queue: "queue.PriorityQueue[Any]" = queue.PriorityQueue()
+        # Async queue + background loop for pre-caching and refresh-on-edit.
+        self._summary_task_queue = None
+        self._pending_summary_tasks: List[Any] = []
         self._summary_task_keys = set()
         self._summary_task_keys_lock = threading.Lock()
         self._summary_task_seq = 0
-        self._summary_worker_thread = None
-        self._summary_monitor_thread = None
-        self._stop_event = threading.Event()
+        self._summary_worker_task = None
+        self._summary_monitor_task = None
+        self._summary_background_loop = None
+        self._summary_background_thread = None
+        self._summary_stop_event = None
         self._summary_background_started = False
 
         # Runtime stats for cache observability.
@@ -323,6 +326,14 @@ class GameDocServer:
 
         self._watched_file_sigs: Dict[str, str] = {}
 
+        try:
+            self.summary_executor_max_workers = int(os.environ.get("SUMMARY_EXECUTOR_MAX_WORKERS", "4"))
+        except Exception:
+            self.summary_executor_max_workers = 4
+        if self.summary_executor_max_workers < 1:
+            self.summary_executor_max_workers = 1
+        self._summary_executor = ThreadPoolExecutor(max_workers=self.summary_executor_max_workers, thread_name_prefix="summary")
+
         self._init_summary_store()
 
     def _sqlite_row_count(self) -> int:
@@ -357,7 +368,14 @@ class GameDocServer:
             inflight = len(self._summary_inflight)
         with self._summary_task_keys_lock:
             queue_unique_keys = len(self._summary_task_keys)
-        queue_depth = self._summary_task_queue.qsize()
+            pending_depth = len(self._pending_summary_tasks)
+        if self._summary_task_queue is not None:
+            try:
+                queue_depth = int(self._summary_task_queue.qsize())
+            except Exception:
+                queue_depth = pending_depth
+        else:
+            queue_depth = pending_depth
 
         status = {
             "status": "ok",
@@ -675,66 +693,7 @@ class GameDocServer:
         prompt = self._build_summary_prompt(scope, target, depth)
         return _call_ollama_generate(self.ollama_model, prompt, keep_alive=self.ollama_keep_alive)
 
-    def _get_or_compute_summary(self, scope: str, target: str, depth: str) -> str:
-        content_sig = self._summary_content_signature(scope, target)
-        cache_key = self._cache_key(scope, target, depth, content_sig)
-        now_ts = time.time()
-
-        if self.summary_cache_enabled:
-            mem = self._mem_get_summary(cache_key, now_ts)
-            if mem is not None:
-                with self._cache_stats_lock:
-                    self._cache_hits_mem += 1
-                return mem
-            disk = self._sqlite_get_summary(cache_key, now_ts)
-            if disk is not None:
-                with self._cache_stats_lock:
-                    self._cache_hits_sqlite += 1
-                self._mem_put_summary(cache_key, disk, now_ts)
-                return disk
-
-        with self._cache_stats_lock:
-            self._cache_misses += 1
-
-        waiter = None
-        with self._summary_cache_lock:
-            waiter = self._summary_inflight.get(cache_key)
-            if waiter is None:
-                waiter = threading.Event()
-                self._summary_inflight[cache_key] = waiter
-                is_owner = True
-            else:
-                is_owner = False
-
-        if not is_owner:
-            waiter.wait(timeout=180)
-            now_ts = time.time()
-            mem = self._mem_get_summary(cache_key, now_ts)
-            if mem is not None:
-                return mem
-            disk = self._sqlite_get_summary(cache_key, now_ts)
-            if disk is not None:
-                self._mem_put_summary(cache_key, disk, now_ts)
-                return disk
-            # If the owner failed, fall back to direct compute.
-            return self._compute_summary(scope, target, depth)
-
-        try:
-            summary = self._compute_summary(scope, target, depth)
-            now_ts = time.time()
-            with self._cache_stats_lock:
-                self._cache_computes += 1
-            if self.summary_cache_enabled:
-                self._mem_put_summary(cache_key, summary, now_ts)
-                self._sqlite_put_summary(cache_key, scope, target, depth, content_sig, summary, now_ts)
-            return summary
-        finally:
-            with self._summary_cache_lock:
-                ev = self._summary_inflight.pop(cache_key, None)
-                if ev is not None:
-                    ev.set()
-
-    def _enqueue_summary_task(self, scope: str, target: str, depth: str, reason: str) -> None:
+    def _build_summary_task(self, scope: str, target: str, depth: str, reason: str):
         priority_map = {
             "live_request": 0,
             "file_changed": 1,
@@ -748,38 +707,51 @@ class GameDocServer:
         task_key = f"{scope}|{target}|{depth}"
         with self._summary_task_keys_lock:
             if task_key in self._summary_task_keys:
-                return
+                return None
             self._summary_task_keys.add(task_key)
             self._summary_task_seq += 1
             seq = self._summary_task_seq
-        self._summary_task_queue.put(
-            (
-                prio,
-                seq,
-                {
-                    "scope": scope,
-                    "target": target,
-                    "depth": depth,
-                    "reason": reason,
-                },
-            )
+        return (
+            prio,
+            seq,
+            {
+                "scope": scope,
+                "target": target,
+                "depth": depth,
+                "reason": reason,
+                "task_key": task_key,
+            },
         )
 
-    def _summary_worker_loop(self) -> None:
+    def _enqueue_summary_task(self, scope: str, target: str, depth: str, reason: str) -> None:
+        item = self._build_summary_task(scope, target, depth, reason)
+        if item is None:
+            return
+        if self._summary_background_loop is not None and self._summary_task_queue is not None:
+            self._summary_background_loop.call_soon_threadsafe(self._summary_task_queue.put_nowait, item)
+            return
+        with self._summary_task_keys_lock:
+            self._pending_summary_tasks.append(item)
+
+    async def _summary_worker_loop(self) -> None:
         logger = logging.getLogger("GameDocServer.SummaryWorker")
-        while not self._stop_event.is_set():
+        while True:
             try:
-                _prio, _seq, task = self._summary_task_queue.get(timeout=1.0)
-            except queue.Empty:
+                if self._summary_stop_event is not None and self._summary_stop_event.is_set():
+                    break
+                _prio, _seq, task = await asyncio.wait_for(self._summary_task_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                break
 
             scope = task.get("scope")
             target = task.get("target")
             depth = task.get("depth")
             reason = task.get("reason")
-            task_key = f"{scope}|{target}|{depth}"
+            task_key = task.get("task_key") or f"{scope}|{target}|{depth}"
             try:
-                _ = self._get_or_compute_summary(scope, target, depth)
+                _ = await self._get_or_compute_summary_async(scope, target, depth)
                 logger.info("Summary task complete: %s (%s) [%s]", target, scope, reason)
                 with self._cache_stats_lock:
                     self._worker_tasks_completed += 1
@@ -798,7 +770,7 @@ class GameDocServer:
                 except Exception:
                     pass
                 if self.summary_worker_delay_ms > 0:
-                    time.sleep(self.summary_worker_delay_ms / 1000.0)
+                    await asyncio.sleep(self.summary_worker_delay_ms / 1000.0)
 
     def _all_summary_directories(self) -> List[str]:
         dirs = [""]
@@ -846,14 +818,19 @@ class GameDocServer:
                 continue
         return sigs
 
-    def _summary_monitor_loop(self) -> None:
+    async def _summary_monitor_loop(self) -> None:
         logger = logging.getLogger("GameDocServer.SummaryMonitor")
-        self._watched_file_sigs = self._snapshot_file_sigs()
+        self._watched_file_sigs = await self._run_summary_blocking(self._snapshot_file_sigs)
         next_status_log = time.time() + max(self.summary_status_log_interval_sec, 5)
-        while not self._stop_event.is_set():
-            time.sleep(max(self.summary_monitor_interval_sec, 3))
+        while True:
+            if self._summary_stop_event is not None and self._summary_stop_event.is_set():
+                break
             try:
-                current = self._snapshot_file_sigs()
+                await asyncio.sleep(max(self.summary_monitor_interval_sec, 3))
+            except asyncio.CancelledError:
+                break
+            try:
+                current = await self._run_summary_blocking(self._snapshot_file_sigs)
                 old_keys = set(self._watched_file_sigs.keys())
                 new_keys = set(current.keys())
 
@@ -901,23 +878,86 @@ class GameDocServer:
                 with self._cache_stats_lock:
                     self._cache_errors += 1
 
-    def _start_summary_background(self) -> None:
-        if not self.summary_cache_enabled:
+    def _ensure_summary_background_loop(self) -> None:
+        if self._summary_background_loop is not None and self._summary_background_thread is not None and self._summary_background_thread.is_alive():
             return
+
+        ready = threading.Event()
+
+        def _run_background_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._summary_background_loop = loop
+            self._summary_task_queue = asyncio.PriorityQueue()
+            self._summary_stop_event = asyncio.Event()
+            ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+
+        thread = threading.Thread(target=_run_background_loop, daemon=True)
+        thread.start()
+        if not ready.wait(timeout=5.0):
+            raise RuntimeError("Timed out starting summary background loop")
+        self._summary_background_thread = thread
+
+    async def _start_summary_background_async(self) -> None:
         if self._summary_background_started:
             return
         self._summary_background_started = True
+        self._summary_worker_task = asyncio.create_task(self._summary_worker_loop(), name="summary-worker")
+        self._summary_monitor_task = asyncio.create_task(self._summary_monitor_loop(), name="summary-monitor")
 
-        self._summary_worker_thread = threading.Thread(target=self._summary_worker_loop, daemon=True)
-        self._summary_worker_thread.start()
+        pending = []
+        with self._summary_task_keys_lock:
+            pending = list(self._pending_summary_tasks)
+            self._pending_summary_tasks.clear()
+        for item in pending:
+            self._summary_task_queue.put_nowait(item)
 
-        self._summary_monitor_thread = threading.Thread(target=self._summary_monitor_loop, daemon=True)
-        self._summary_monitor_thread.start()
+        await self._run_summary_blocking(self._seed_precache_queue)
 
-        self._seed_precache_queue()
+    def _start_summary_background(self) -> None:
+        if not self.summary_cache_enabled:
+            return
+        self._ensure_summary_background_loop()
+        future = asyncio.run_coroutine_threadsafe(self._start_summary_background_async(), self._summary_background_loop)
+        future.result(timeout=10.0)
 
-    def shutdown(self) -> None:
-        self._stop_event.set()
+    async def _shutdown_summary_background_async(self) -> None:
+        if self._summary_stop_event is not None:
+            self._summary_stop_event.set()
+
+        tasks = [task for task in (self._summary_worker_task, self._summary_monitor_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._summary_worker_task = None
+        self._summary_monitor_task = None
+        self._summary_task_queue = None
+        self._summary_stop_event = None
+        self._summary_background_started = False
+
+    async def shutdown(self) -> None:
+        if self._summary_background_loop is not None:
+            future = asyncio.run_coroutine_threadsafe(self._shutdown_summary_background_async(), self._summary_background_loop)
+            await asyncio.wrap_future(future)
+            loop = self._summary_background_loop
+            thread = self._summary_background_thread
+            loop.call_soon_threadsafe(loop.stop)
+            if thread is not None:
+                await asyncio.to_thread(thread.join, 5.0)
+            self._summary_background_loop = None
+            self._summary_background_thread = None
         try:
             if self._api_server:
                 if hasattr(self._api_server, "shutdown"):
@@ -930,6 +970,10 @@ class GameDocServer:
             if self._http_server:
                 self._http_server.shutdown()
                 self._http_server.server_close()
+        except Exception:
+            pass
+        try:
+            self._summary_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
 
@@ -1040,7 +1084,7 @@ class GameDocServer:
 
         return self._search_placeholder_deterministic(query, n=n)
 
-    def summarize_context(self, scope: str, target: str, depth: str = None) -> str:
+    async def summarize_context(self, scope: str, target: str, depth: str = None) -> str:
         """Summarize content according to `scope`:
 
         - 'file': `target` is file path; summarize the file.
@@ -1051,7 +1095,7 @@ class GameDocServer:
         if chosen_depth not in ("concise", "detailed"):
             chosen_depth = "concise"
 
-        summary = self._get_or_compute_summary(scope, target, chosen_depth)
+        summary = await self._get_or_compute_summary_async(scope, target, chosen_depth)
 
         # Live requests return concise summaries by default, but queue deeper persisted summaries.
         if chosen_depth == "concise" and self.persisted_summary_depth == "detailed":
@@ -1257,18 +1301,96 @@ class GameDocServer:
             result = resp
 
         elif tool_name == "summarize_context":
-            scope = payload.get("scope")
-            target = payload.get("target")
-            depth = payload.get("depth") or self.live_summary_depth
-            if not scope or not target:
-                raise ValueError("missing scope/target")
-            summary = self.summarize_context(scope, target, depth=depth)
-            result = {"summary": summary}
+            raise RuntimeError("summarize_context is async-only; use the async HTTP tool invoker")
 
         else:
             raise NotImplementedError("Tool not implemented in HTTP API")
 
         return result
+
+    async def _run_summary_blocking(self, fn, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._summary_executor, lambda: fn(*args))
+
+    async def _get_or_compute_summary_async(self, scope: str, target: str, depth: str) -> str:
+        content_sig = await self._run_summary_blocking(self._summary_content_signature, scope, target)
+        cache_key = self._cache_key(scope, target, depth, content_sig)
+        now_ts = time.time()
+
+        if self.summary_cache_enabled:
+            mem = self._mem_get_summary(cache_key, now_ts)
+            if mem is not None:
+                with self._cache_stats_lock:
+                    self._cache_hits_mem += 1
+                return mem
+
+            disk = await self._run_summary_blocking(self._sqlite_get_summary, cache_key, now_ts)
+            if disk is not None:
+                with self._cache_stats_lock:
+                    self._cache_hits_sqlite += 1
+                self._mem_put_summary(cache_key, disk, now_ts)
+                return disk
+
+        with self._cache_stats_lock:
+            self._cache_misses += 1
+
+        with self._summary_cache_lock:
+            waiter = self._summary_inflight.get(cache_key)
+            if waiter is None:
+                waiter = Future()
+                self._summary_inflight[cache_key] = waiter
+                is_owner = True
+            else:
+                is_owner = False
+
+        if not is_owner:
+            try:
+                await asyncio.wait_for(asyncio.wrap_future(waiter), timeout=180)
+            except Exception:
+                pass
+            now_ts = time.time()
+            mem = self._mem_get_summary(cache_key, now_ts)
+            if mem is not None:
+                return mem
+            disk = await self._run_summary_blocking(self._sqlite_get_summary, cache_key, now_ts)
+            if disk is not None:
+                self._mem_put_summary(cache_key, disk, now_ts)
+                return disk
+            return await self._run_summary_blocking(self._compute_summary, scope, target, depth)
+
+        try:
+            summary = await self._run_summary_blocking(self._compute_summary, scope, target, depth)
+            now_ts = time.time()
+            with self._cache_stats_lock:
+                self._cache_computes += 1
+            if self.summary_cache_enabled:
+                self._mem_put_summary(cache_key, summary, now_ts)
+                await self._run_summary_blocking(self._sqlite_put_summary, cache_key, scope, target, depth, content_sig, summary, now_ts)
+            return summary
+        except Exception as exc:
+            if not waiter.done():
+                waiter.set_exception(exc)
+            raise
+        finally:
+            with self._summary_cache_lock:
+                current = self._summary_inflight.get(cache_key)
+                if current is waiter:
+                    self._summary_inflight.pop(cache_key, None)
+            if not waiter.done():
+                waiter.set_result(True)
+
+    async def _invoke_http_tool_async(self, tool_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if tool_name == "summarize_context":
+            scope = payload.get("scope")
+            target = payload.get("target")
+            depth = (payload.get("depth") or self.live_summary_depth or "concise").strip().lower()
+            if depth not in ("concise", "detailed"):
+                depth = "concise"
+            if not scope or not target:
+                raise ValueError("missing scope/target")
+            summary = await self.summarize_context(scope, target, depth)
+            return {"summary": summary}
+        return await asyncio.to_thread(self._invoke_http_tool, tool_name, payload)
 
     def _find_available_port(self, host: str) -> int:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1278,184 +1400,11 @@ class GameDocServer:
         finally:
             s.close()
 
-    def _start_http_api_legacy(self, host: str, port: int):
-        """Start a small HTTP server exposing JSON POST endpoints for tools.
-
-        Exposed endpoints:
-        - GET /.well-known/mcp.json
-        - GET /healthz, GET /readyz
-        - GET /tools -> returns available tools and input schemas
-        - POST /tools/<tool_name> -> invoke tool with JSON body
-        """
-        if self._api_server is not None:
-            return
-
-        host = host or self.bind_host
-        port = port or (int(os.environ.get("PORT", "8000")) + 1)
-
-        # Setup basic logging
-        logger = logging.getLogger("GameDocServer.API")
-        logger.setLevel(logging.INFO)
-
-        class _APIHandler(http.server.BaseHTTPRequestHandler):
-            def _set_cors_headers(self_inner, status=200, extra_headers=None):
-                self_inner.send_response(status)
-                self_inner.send_header("Content-Type", "application/json")
-                self_inner.send_header("Access-Control-Allow-Origin", "*")
-                self_inner.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
-                self_inner.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
-                if extra_headers:
-                    for k, v in extra_headers.items():
-                        self_inner.send_header(k, v)
-                self_inner.end_headers()
-
-            def do_OPTIONS(self_inner):
-                self_inner._set_cors_headers(status=204)
-
-            def do_HEAD(self_inner):
-                self_inner._set_cors_headers(status=200)
-
-            def do_GET(self_inner):
-                parsed = urllib.parse.urlparse(self_inner.path)
-                path = parsed.path
-                req_id = str(uuid.uuid4())
-
-                try:
-                    if path == "/.well-known/mcp.json":
-                        base = self.public_url or f"http://{host}:{port}"
-                        body = {"name": self.name, "base_url": base, "public_url": base, "tools": list(self._tool_schemas.keys())}
-                        self_inner._set_cors_headers(200)
-                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                        return
-
-                    if path == "/healthz":
-                        body = {"status": "ok", "request_id": req_id}
-                        self_inner._set_cors_headers(200)
-                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                        return
-
-                    if path == "/readyz":
-                        # For now ready when server is up; indexing may be async
-                        body = {"status": "ok", "indexed": bool(self.indexer is not None), "request_id": req_id}
-                        self_inner._set_cors_headers(200)
-                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                        return
-
-                    if path == "/tools":
-                        body = {"tools": self._tool_schemas}
-                        self_inner._set_cors_headers(200)
-                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                        return
-
-                    if path == "/cache_status":
-                        body = self.get_cache_status()
-                        body["request_id"] = req_id
-                        self_inner._set_cors_headers(200)
-                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                        return
-
-                    # Fallback: 404
-                    body = {"error": "not_found", "request_id": req_id}
-                    self_inner._set_cors_headers(404)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                except Exception as e:
-                    logger.exception("GET handler error")
-                    body = {"error": "internal", "message": str(e), "request_id": req_id}
-                    self_inner._set_cors_headers(500)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-
-            def do_POST(self_inner):
-                parsed = urllib.parse.urlparse(self_inner.path)
-                path = parsed.path
-                req_id = str(uuid.uuid4())
-                logger.info("Request %s %s %s", req_id, self_inner.command, path)
-
-                # Expect /tools/<tool_name>
-                parts = path.strip("/").split("/")
-                if len(parts) != 2 or parts[0] != "tools":
-                    body = {"error": "not_found", "request_id": req_id}
-                    self_inner._set_cors_headers(404)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                    return
-
-                tool_name = parts[1]
-                if tool_name not in self._tool_schemas:
-                    body = {"error": "unknown_tool", "request_id": req_id}
-                    self_inner._set_cors_headers(404)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                    return
-
-                # Read JSON body
-                length = int(self_inner.headers.get("Content-Length", "0"))
-                if length == 0:
-                    body = {"error": "empty_body", "request_id": req_id}
-                    self_inner._set_cors_headers(400)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                    return
-
-                raw = self_inner.rfile.read(length)
-                try:
-                    payload = _json.loads(raw.decode("utf-8"))
-                except Exception:
-                    body = {"error": "invalid_json", "request_id": req_id}
-                    self_inner._set_cors_headers(400)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                    return
-
-                # Map payload keys to local method parameter names
-                try:
-                    result = self._invoke_http_tool(tool_name, payload)
-                    body = {"request_id": req_id, "result": result}
-                    self_inner._set_cors_headers(200)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                except FileNotFoundError as e:
-                    body = {"error": "not_found", "message": str(e), "request_id": req_id}
-                    self_inner._set_cors_headers(404)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                except PermissionError as e:
-                    body = {"error": "forbidden", "message": str(e), "request_id": req_id}
-                    self_inner._set_cors_headers(403)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                except ValueError as e:
-                    body = {"error": "bad_request", "message": str(e), "request_id": req_id}
-                    self_inner._set_cors_headers(400)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-                except Exception as e:
-                    logger.exception("Tool invocation failed")
-                    body = {"error": "internal", "message": str(e), "request_id": req_id}
-                    self_inner._set_cors_headers(500)
-                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
-
-            def log_message(self_inner, format, *args):
-                # route to logger
-                logger.info(format % args)
-
-        class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-            daemon_threads = True
-
-        srv = _ThreadingHTTPServer((host, port), _APIHandler)
-        self._api_server = srv
-
-        def _serve_api():
-            try:
-                srv.serve_forever()
-            finally:
-                try:
-                    srv.server_close()
-                except Exception:
-                    pass
-
-        t = threading.Thread(target=_serve_api, daemon=True)
-        t.start()
-        self._api_thread = t
-        self._api_impl = "legacy"
-        logging.getLogger("GameDocServer.API").info("HTTP API started at http://%s:%s", host, port)
-
     def _start_http_api_fastapi(self, host: str, port: int):
         if not FASTAPI_AVAILABLE:
-            raise RuntimeError("FastAPI backend requested but fastapi/uvicorn are not installed")
+            raise RuntimeError("FastAPI backend requires fastapi and uvicorn to be installed")
 
-        from fastapi import FastAPI, Request  # type: ignore[import-not-found]
+        from fastapi import FastAPI, Request, Response  # type: ignore[import-not-found]
         from fastapi.middleware.cors import CORSMiddleware  # type: ignore[import-not-found]
         from fastapi.responses import JSONResponse  # type: ignore[import-not-found]
         import uvicorn  # type: ignore[import-not-found]
@@ -1481,7 +1430,14 @@ class GameDocServer:
         @app.options("/{path:path}")
         async def options_handler(path: str):
             _ = path
-            return JSONResponse(status_code=204, content={})
+            return Response(
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+                    "Access-Control-Allow-Headers": "Content-Type, Accept",
+                },
+            )
 
         @app.get("/.well-known/mcp.json")
         async def discovery():
@@ -1491,6 +1447,10 @@ class GameDocServer:
 
         @app.get("/healthz")
         async def healthz():
+            return JSONResponse(content={"status": "ok", "request_id": str(uuid.uuid4())})
+
+        @app.head("/healthz")
+        async def healthz_head():
             return JSONResponse(content={"status": "ok", "request_id": str(uuid.uuid4())})
 
         @app.get("/readyz")
@@ -1525,7 +1485,7 @@ class GameDocServer:
                 return JSONResponse(status_code=400, content={"error": "invalid_json", "request_id": req_id})
 
             try:
-                result = self._invoke_http_tool(tool_name, payload)
+                result = await self._invoke_http_tool_async(tool_name, payload)
                 return JSONResponse(status_code=200, content={"request_id": req_id, "result": result})
             except FileNotFoundError as e:
                 return JSONResponse(status_code=404, content={"error": "not_found", "message": str(e), "request_id": req_id})
@@ -1573,12 +1533,7 @@ class GameDocServer:
         logging.getLogger("GameDocServer.API").info("HTTP API started at http://%s:%s", host, port)
 
     def start_http_api(self, host: str = None, port: int = None, impl: str = None):
-        """Start HTTP API server with selectable backend implementation.
-
-        Supported implementations:
-        - legacy: built-in http.server-based implementation
-        - fastapi: FastAPI + uvicorn implementation
-        """
+        """Start the HTTP API server using the FastAPI backend."""
         if self._api_server is not None:
             return
 
@@ -1587,11 +1542,10 @@ class GameDocServer:
         if int(port) == 0:
             port = self._find_available_port(host)
 
-        api_impl = (impl or os.environ.get("HTTP_API_IMPL") or "legacy").strip().lower()
-        if api_impl == "fastapi":
-            self._start_http_api_fastapi(host, int(port))
-        else:
-            self._start_http_api_legacy(host, int(port))
+        api_impl = (impl or os.environ.get("HTTP_API_IMPL") or "fastapi").strip().lower()
+        if api_impl not in ("", "fastapi"):
+            raise RuntimeError("Legacy HTTP API backend has been removed; use fastapi")
+        self._start_http_api_fastapi(host, int(port))
 
         # Trigger non-blocking Ollama prewarm after API startup.
         self._start_ollama_prewarm()
@@ -1627,4 +1581,4 @@ if __name__ == "__main__":
             time.sleep(1)
     except KeyboardInterrupt:
         print("Shutting down GameDocServer")
-        svc.shutdown()
+        asyncio.run(svc.shutdown())
