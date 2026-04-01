@@ -1,4 +1,4 @@
-Local Documentation MCP Server (scaffold)
+Librarian MCP Server (scaffold)
 
 Quick start
 
@@ -17,9 +17,9 @@ python server.py
 
 Files
 
-- [doc_mcp/server.py](doc_mcp/server.py) — MCP server skeleton.
-- [doc_mcp/indexer.py](doc_mcp/indexer.py) — RAG/indexing placeholders.
-- [doc_mcp/requirements.txt](doc_mcp/requirements.txt) — required packages.
+- [librarian_mcp/server.py](librarian_mcp/server.py) — MCP server skeleton.
+- [librarian_mcp/indexer.py](librarian_mcp/indexer.py) — RAG/indexing placeholders.
+- [librarian_mcp/requirements.txt](librarian_mcp/requirements.txt) — required packages.
 
 Next steps
 
@@ -33,7 +33,7 @@ Configuration
 
 Tests
 
-- Run tests with `pytest` from the `doc_mcp` directory:
+- Run tests with `pytest` from the `librarian_mcp` directory:
 
 ```powershell
 python -m pip install -r requirements.txt

@@ -203,4 +203,3 @@ class DocIndexer:
 
 if __name__ == "__main__":
     print("DocIndexer module loaded. Use DocIndexer.process_directory() and semantic_search().")
-

@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 import pytest
 
-from doc_mcp import server
+from librarian_mcp import server
 
 
 def test_resolve_within_root_allows_relative_and_rejects_escape(tmp_path):
