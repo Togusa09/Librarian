@@ -1497,7 +1497,7 @@ class GameDocServer:
                 logger.exception("Tool invocation failed")
                 return JSONResponse(status_code=500, content={"error": "internal", "message": str(e), "request_id": req_id})
 
-        config = uvicorn.Config(app=app, host=host, port=port, log_level="warning")
+        config = uvicorn.Config(app=app, host=host, port=port, log_level="warning", ws="none")
         uv_server = uvicorn.Server(config=config)
 
         def _serve_api():
