@@ -29,7 +29,10 @@ import logging
 import hashlib
 import math
 import time
+import importlib.util
 from collections import OrderedDict
+
+FASTAPI_AVAILABLE = importlib.util.find_spec("fastapi") is not None and importlib.util.find_spec("uvicorn") is not None
 
 # MCP server import (try FastMCP first)
 try:
@@ -221,6 +224,7 @@ class GameDocServer:
         # HTTP API server (for LLM-friendly JSON POST tool API)
         self._api_server = None
         self._api_thread = None
+        self._api_impl = None
         # Simple tool schema registry used by the HTTP API
         self._tool_schemas = {
             "list_files": {"input": {"directory": "string", "limit": "int?", "offset": "int?"}, "output": {"files": "list"}},
@@ -916,8 +920,10 @@ class GameDocServer:
         self._stop_event.set()
         try:
             if self._api_server:
-                self._api_server.shutdown()
-                self._api_server.server_close()
+                if hasattr(self._api_server, "shutdown"):
+                    self._api_server.shutdown()
+                if hasattr(self._api_server, "server_close"):
+                    self._api_server.server_close()
         except Exception:
             pass
         try:
@@ -1212,7 +1218,67 @@ class GameDocServer:
             setattr(self.server, "read_binary", self.read_binary)
 
     # Minimal HTTP JSON API for LLM-friendly tool calls
-    def start_http_api(self, host: str = None, port: int = None):
+    def _invoke_http_tool(self, tool_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Invoke one HTTP-exposed tool using parity-compatible payload mapping."""
+        result = None
+        if tool_name == "list_files":
+            directory = payload.get("path") or payload.get("directory") or ""
+            result = {"files": self.list_files(directory)}
+
+        elif tool_name == "read_document":
+            fp = payload.get("path") or payload.get("file_path") or payload.get("file")
+            if not fp:
+                raise ValueError("missing path")
+            txt = self.read_document(fp)
+            result = {"text": txt, "mime": "text/markdown"}
+
+        elif tool_name == "search_knowledge_base":
+            q = payload.get("q") or payload.get("query")
+            top_k = int(payload.get("top_k", payload.get("n", 5)))
+            if not q:
+                raise ValueError("missing q")
+            res = self.search_knowledge_base(q, n=top_k)
+            result = {"results": self._normalize_search_results(res)}
+
+        elif tool_name == "read_binary":
+            fp = payload.get("path") or payload.get("file_path") or payload.get("file")
+            if not fp:
+                raise ValueError("missing path")
+            prefer = payload.get("prefer")
+            max_inline = payload.get("max_inline_bytes")
+            resp = self.read_binary(fp, max_inline_bytes=max_inline if max_inline is not None else 5 * 1024 * 1024)
+            # honor prefer
+            if prefer == "redirect" and resp.get("method") == "inline":
+                # force http adapter
+                resp = self.read_binary(fp, max_inline_bytes=0)
+            if prefer == "base64" and resp.get("method") == "http":
+                # try to inline
+                resp = self.read_binary(fp, max_inline_bytes=10 * 1024 * 1024)
+            result = resp
+
+        elif tool_name == "summarize_context":
+            scope = payload.get("scope")
+            target = payload.get("target")
+            depth = payload.get("depth") or self.live_summary_depth
+            if not scope or not target:
+                raise ValueError("missing scope/target")
+            summary = self.summarize_context(scope, target, depth=depth)
+            result = {"summary": summary}
+
+        else:
+            raise NotImplementedError("Tool not implemented in HTTP API")
+
+        return result
+
+    def _find_available_port(self, host: str) -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((host, 0))
+            return int(s.getsockname()[1])
+        finally:
+            s.close()
+
+    def _start_http_api_legacy(self, host: str, port: int):
         """Start a small HTTP server exposing JSON POST endpoints for tools.
 
         Exposed endpoints:
@@ -1230,7 +1296,6 @@ class GameDocServer:
         # Setup basic logging
         logger = logging.getLogger("GameDocServer.API")
         logger.setLevel(logging.INFO)
-        docs_root = str(self.docs_root)
 
         class _APIHandler(http.server.BaseHTTPRequestHandler):
             def _set_cors_headers(self_inner, status=200, extra_headers=None):
@@ -1339,54 +1404,7 @@ class GameDocServer:
 
                 # Map payload keys to local method parameter names
                 try:
-                    result = None
-                    if tool_name == "list_files":
-                        directory = payload.get("path") or payload.get("directory") or ""
-                        result = {"files": self.list_files(directory)}
-
-                    elif tool_name == "read_document":
-                        fp = payload.get("path") or payload.get("file_path") or payload.get("file")
-                        if not fp:
-                            raise ValueError("missing path")
-                        txt = self.read_document(fp)
-                        result = {"text": txt, "mime": "text/markdown"}
-
-                    elif tool_name == "search_knowledge_base":
-                        q = payload.get("q") or payload.get("query")
-                        top_k = int(payload.get("top_k", payload.get("n", 5)))
-                        if not q:
-                            raise ValueError("missing q")
-                        res = self.search_knowledge_base(q, n=top_k)
-                        result = {"results": self._normalize_search_results(res)}
-
-                    elif tool_name == "read_binary":
-                        fp = payload.get("path") or payload.get("file_path") or payload.get("file")
-                        if not fp:
-                            raise ValueError("missing path")
-                        prefer = payload.get("prefer")
-                        max_inline = payload.get("max_inline_bytes")
-                        resp = self.read_binary(fp, max_inline_bytes=max_inline if max_inline is not None else 5 * 1024 * 1024)
-                        # honor prefer
-                        if prefer == "redirect" and resp.get("method") == "inline":
-                            # force http adapter
-                            resp = self.read_binary(fp, max_inline_bytes=0)
-                        if prefer == "base64" and resp.get("method") == "http":
-                            # try to inline
-                            resp = self.read_binary(fp, max_inline_bytes=10 * 1024 * 1024)
-                        result = resp
-
-                    elif tool_name == "summarize_context":
-                        scope = payload.get("scope")
-                        target = payload.get("target")
-                        depth = payload.get("depth") or self.live_summary_depth
-                        if not scope or not target:
-                            raise ValueError("missing scope/target")
-                        summary = self.summarize_context(scope, target, depth=depth)
-                        result = {"summary": summary}
-
-                    else:
-                        raise NotImplementedError("Tool not implemented in HTTP API")
-
+                    result = self._invoke_http_tool(tool_name, payload)
                     body = {"request_id": req_id, "result": result}
                     self_inner._set_cors_headers(200)
                     self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
@@ -1430,7 +1448,150 @@ class GameDocServer:
         t = threading.Thread(target=_serve_api, daemon=True)
         t.start()
         self._api_thread = t
+        self._api_impl = "legacy"
         logging.getLogger("GameDocServer.API").info("HTTP API started at http://%s:%s", host, port)
+
+    def _start_http_api_fastapi(self, host: str, port: int):
+        if not FASTAPI_AVAILABLE:
+            raise RuntimeError("FastAPI backend requested but fastapi/uvicorn are not installed")
+
+        from fastapi import FastAPI, Request  # type: ignore[import-not-found]
+        from fastapi.middleware.cors import CORSMiddleware  # type: ignore[import-not-found]
+        from fastapi.responses import JSONResponse  # type: ignore[import-not-found]
+        import uvicorn  # type: ignore[import-not-found]
+        from starlette.exceptions import HTTPException as StarletteHTTPException
+
+        app = FastAPI()
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
+            allow_headers=["Content-Type", "Accept"],
+        )
+
+        logger = logging.getLogger("GameDocServer.API")
+        logger.setLevel(logging.INFO)
+
+        @app.exception_handler(StarletteHTTPException)
+        async def starlette_exception_handler(_request, exc):
+            if exc.status_code == 404:
+                return JSONResponse(status_code=404, content={"error": "not_found", "request_id": str(uuid.uuid4())})
+            return JSONResponse(status_code=exc.status_code, content={"error": "internal", "message": str(exc.detail), "request_id": str(uuid.uuid4())})
+
+        @app.options("/{path:path}")
+        async def options_handler(path: str):
+            _ = path
+            return JSONResponse(status_code=204, content={})
+
+        @app.get("/.well-known/mcp.json")
+        async def discovery():
+            base = self.public_url or f"http://{host}:{port}"
+            body = {"name": self.name, "base_url": base, "public_url": base, "tools": list(self._tool_schemas.keys())}
+            return JSONResponse(content=body)
+
+        @app.get("/healthz")
+        async def healthz():
+            return JSONResponse(content={"status": "ok", "request_id": str(uuid.uuid4())})
+
+        @app.get("/readyz")
+        async def readyz():
+            body = {"status": "ok", "indexed": bool(self.indexer is not None), "request_id": str(uuid.uuid4())}
+            return JSONResponse(content=body)
+
+        @app.get("/tools")
+        async def tools():
+            return JSONResponse(content={"tools": self._tool_schemas})
+
+        @app.get("/cache_status")
+        async def cache_status():
+            body = self.get_cache_status()
+            body["request_id"] = str(uuid.uuid4())
+            return JSONResponse(content=body)
+
+        @app.post("/tools/{tool_name}")
+        async def post_tool(tool_name: str, request: Request):
+            req_id = str(uuid.uuid4())
+            logger.info("Request %s POST /tools/%s", req_id, tool_name)
+
+            if tool_name not in self._tool_schemas:
+                return JSONResponse(status_code=404, content={"error": "unknown_tool", "request_id": req_id})
+
+            try:
+                body_raw = await request.body()
+                if not body_raw:
+                    return JSONResponse(status_code=400, content={"error": "empty_body", "request_id": req_id})
+                payload = _json.loads(body_raw.decode("utf-8"))
+            except Exception:
+                return JSONResponse(status_code=400, content={"error": "invalid_json", "request_id": req_id})
+
+            try:
+                result = self._invoke_http_tool(tool_name, payload)
+                return JSONResponse(status_code=200, content={"request_id": req_id, "result": result})
+            except FileNotFoundError as e:
+                return JSONResponse(status_code=404, content={"error": "not_found", "message": str(e), "request_id": req_id})
+            except PermissionError as e:
+                return JSONResponse(status_code=403, content={"error": "forbidden", "message": str(e), "request_id": req_id})
+            except ValueError as e:
+                return JSONResponse(status_code=400, content={"error": "bad_request", "message": str(e), "request_id": req_id})
+            except Exception as e:
+                logger.exception("Tool invocation failed")
+                return JSONResponse(status_code=500, content={"error": "internal", "message": str(e), "request_id": req_id})
+
+        config = uvicorn.Config(app=app, host=host, port=port, log_level="warning")
+        uv_server = uvicorn.Server(config=config)
+
+        def _serve_api():
+            uv_server.run()
+
+        t = threading.Thread(target=_serve_api, daemon=True)
+        t.start()
+        self._api_thread = t
+
+        # Wait briefly for server startup.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if getattr(uv_server, "started", False):
+                break
+            time.sleep(0.01)
+
+        class _UvicornHandle:
+            def __init__(self, server_ref, thread_ref, bind_host, bind_port):
+                self._server_ref = server_ref
+                self._thread_ref = thread_ref
+                self.server_address = (bind_host, bind_port)
+
+            def shutdown(self):
+                self._server_ref.should_exit = True
+                if self._thread_ref is not None:
+                    self._thread_ref.join(timeout=5.0)
+
+            def server_close(self):
+                return None
+
+        self._api_server = _UvicornHandle(uv_server, t, host, port)
+        self._api_impl = "fastapi"
+        logging.getLogger("GameDocServer.API").info("HTTP API started at http://%s:%s", host, port)
+
+    def start_http_api(self, host: str = None, port: int = None, impl: str = None):
+        """Start HTTP API server with selectable backend implementation.
+
+        Supported implementations:
+        - legacy: built-in http.server-based implementation
+        - fastapi: FastAPI + uvicorn implementation
+        """
+        if self._api_server is not None:
+            return
+
+        host = host or self.bind_host
+        port = port if port is not None else (int(os.environ.get("PORT", "8000")) + 1)
+        if int(port) == 0:
+            port = self._find_available_port(host)
+
+        api_impl = (impl or os.environ.get("HTTP_API_IMPL") or "legacy").strip().lower()
+        if api_impl == "fastapi":
+            self._start_http_api_fastapi(host, int(port))
+        else:
+            self._start_http_api_legacy(host, int(port))
 
         # Trigger non-blocking Ollama prewarm after API startup.
         self._start_ollama_prewarm()

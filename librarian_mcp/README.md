@@ -116,6 +116,12 @@ This server exposes a small HTTP JSON API intended for programmatic LLM tool inv
 - `GET /tools` — returns available tools and their simple input schemas.
 - `POST /tools/<tool_name>` — invoke a tool with a JSON body. Use `Content-Type: application/json`.
 
+Backend selection
+
+- `HTTP_API_IMPL=legacy` uses the existing `http.server` implementation.
+- `HTTP_API_IMPL=fastapi` uses the FastAPI implementation.
+- Default is `legacy` during migration.
+
 Example curl commands:
 
 ```bash
