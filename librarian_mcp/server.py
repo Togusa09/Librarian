@@ -20,6 +20,9 @@ import socketserver
 import socket
 import urllib.parse
 import os
+import json as _json
+import uuid
+import logging
 
 # MCP server import (try FastMCP first)
 try:
@@ -141,6 +144,17 @@ class GameDocServer:
         self._http_server = None
         self._http_thread = None
         self._http_port = None
+        # HTTP API server (for LLM-friendly JSON POST tool API)
+        self._api_server = None
+        self._api_thread = None
+        # Simple tool schema registry used by the HTTP API
+        self._tool_schemas = {
+            "list_files": {"input": {"directory": "string", "limit": "int?", "offset": "int?"}, "output": {"files": "list"}},
+            "read_document": {"input": {"file_path": "string"}, "output": {"text": "string", "mime": "string?"}},
+            "search_knowledge_base": {"input": {"q": "string", "top_k": "int?"}, "output": {"results": "list"}},
+            "read_binary": {"input": {"file_path": "string", "prefer": "string?", "max_inline_bytes": "int?"}, "output": {"method": "string", "data_b64": "string?", "url": "string?", "content_type": "string", "size": "int"}},
+            "summarize_context": {"input": {"scope": "string", "target": "string"}, "output": {"summary": "string"}},
+        }
 
     # Tool implementations
     def list_files(self, directory: str = "") -> List[str]:
@@ -392,6 +406,227 @@ class GameDocServer:
             setattr(self.server, "search_knowledge_base", self.search_knowledge_base)
             setattr(self.server, "summarize_context", self.summarize_context)
             setattr(self.server, "read_binary", self.read_binary)
+
+    # Minimal HTTP JSON API for LLM-friendly tool calls
+    def start_http_api(self, host: str = None, port: int = None):
+        """Start a small HTTP server exposing JSON POST endpoints for tools.
+
+        Exposed endpoints:
+        - GET /.well-known/mcp.json
+        - GET /healthz, GET /readyz
+        - GET /tools -> returns available tools and input schemas
+        - POST /tools/<tool_name> -> invoke tool with JSON body
+        """
+        if self._api_server is not None:
+            return
+
+        host = host or self.bind_host
+        port = port or (int(os.environ.get("PORT", "8000")) + 1)
+
+        # Setup basic logging
+        logger = logging.getLogger("GameDocServer.API")
+        logger.setLevel(logging.INFO)
+
+        docs_root = str(self.docs_root)
+
+        class _APIHandler(http.server.BaseHTTPRequestHandler):
+            def _set_cors_headers(self_inner, status=200, extra_headers=None):
+                self_inner.send_response(status)
+                self_inner.send_header("Content-Type", "application/json")
+                self_inner.send_header("Access-Control-Allow-Origin", "*")
+                self_inner.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
+                self_inner.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+                if extra_headers:
+                    for k, v in extra_headers.items():
+                        self_inner.send_header(k, v)
+                self_inner.end_headers()
+
+            def do_OPTIONS(self_inner):
+                self_inner._set_cors_headers(status=204)
+
+            def do_HEAD(self_inner):
+                self_inner._set_cors_headers(status=200)
+
+            def do_GET(self_inner):
+                parsed = urllib.parse.urlparse(self_inner.path)
+                path = parsed.path
+                req_id = str(uuid.uuid4())
+
+                try:
+                    if path == "/.well-known/mcp.json":
+                        base = f"http://{host}:{port}"
+                        body = {"name": self.name, "base_url": base, "tools": list(self._tool_schemas.keys())}
+                        self_inner._set_cors_headers(200)
+                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                        return
+
+                    if path == "/healthz":
+                        body = {"status": "ok", "request_id": req_id}
+                        self_inner._set_cors_headers(200)
+                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                        return
+
+                    if path == "/readyz":
+                        # For now ready when server is up; indexing may be async
+                        body = {"status": "ok", "indexed": bool(self.indexer is not None), "request_id": req_id}
+                        self_inner._set_cors_headers(200)
+                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                        return
+
+                    if path == "/tools":
+                        body = {"tools": self._tool_schemas}
+                        self_inner._set_cors_headers(200)
+                        self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                        return
+
+                    # Fallback: 404
+                    body = {"error": "not_found", "request_id": req_id}
+                    self_inner._set_cors_headers(404)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                except Exception as e:
+                    logger.exception("GET handler error")
+                    body = {"error": "internal", "message": str(e), "request_id": req_id}
+                    self_inner._set_cors_headers(500)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+
+            def do_POST(self_inner):
+                parsed = urllib.parse.urlparse(self_inner.path)
+                path = parsed.path
+                req_id = str(uuid.uuid4())
+                logger.info("Request %s %s %s", req_id, self_inner.command, path)
+
+                # Expect /tools/<tool_name>
+                parts = path.strip("/").split("/")
+                if len(parts) != 2 or parts[0] != "tools":
+                    body = {"error": "not_found", "request_id": req_id}
+                    self_inner._set_cors_headers(404)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                    return
+
+                tool_name = parts[1]
+                if tool_name not in self._tool_schemas:
+                    body = {"error": "unknown_tool", "request_id": req_id}
+                    self_inner._set_cors_headers(404)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                    return
+
+                # Read JSON body
+                length = int(self_inner.headers.get("Content-Length", "0"))
+                if length == 0:
+                    body = {"error": "empty_body", "request_id": req_id}
+                    self_inner._set_cors_headers(400)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                    return
+
+                raw = self_inner.rfile.read(length)
+                try:
+                    payload = _json.loads(raw.decode("utf-8"))
+                except Exception:
+                    body = {"error": "invalid_json", "request_id": req_id}
+                    self_inner._set_cors_headers(400)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                    return
+
+                # Map payload keys to local method parameter names
+                try:
+                    result = None
+                    if tool_name == "list_files":
+                        directory = payload.get("path") or payload.get("directory") or ""
+                        result = {"files": self.list_files(directory)}
+
+                    elif tool_name == "read_document":
+                        fp = payload.get("path") or payload.get("file_path") or payload.get("file")
+                        if not fp:
+                            raise ValueError("missing path")
+                        txt = self.read_document(fp)
+                        result = {"text": txt, "mime": "text/markdown"}
+
+                    elif tool_name == "search_knowledge_base":
+                        q = payload.get("q") or payload.get("query")
+                        top_k = int(payload.get("top_k", payload.get("n", 5)))
+                        if not q:
+                            raise ValueError("missing q")
+                        res = self.search_knowledge_base(q, n=top_k)
+                        # Normalize results to include path/title/snippet when possible
+                        normalized = []
+                        for r in res:
+                            md = r.get("metadata") or {}
+                            src = md.get("source") or md.get("path") or None
+                            snippet = r.get("document")
+                            normalized.append({"path": src, "score": r.get("distance"), "snippet": snippet, "metadata": md})
+                        result = {"results": normalized}
+
+                    elif tool_name == "read_binary":
+                        fp = payload.get("path") or payload.get("file_path") or payload.get("file")
+                        if not fp:
+                            raise ValueError("missing path")
+                        prefer = payload.get("prefer")
+                        max_inline = payload.get("max_inline_bytes")
+                        resp = self.read_binary(fp, max_inline_bytes=max_inline if max_inline is not None else 5 * 1024 * 1024)
+                        # honor prefer
+                        if prefer == "redirect" and resp.get("method") == "inline":
+                            # force http adapter
+                            resp = self.read_binary(fp, max_inline_bytes=0)
+                        if prefer == "base64" and resp.get("method") == "http":
+                            # try to inline
+                            resp = self.read_binary(fp, max_inline_bytes=10 * 1024 * 1024)
+                        result = resp
+
+                    elif tool_name == "summarize_context":
+                        scope = payload.get("scope")
+                        target = payload.get("target")
+                        if not scope or not target:
+                            raise ValueError("missing scope/target")
+                        summary = self.summarize_context(scope, target)
+                        result = {"summary": summary}
+
+                    else:
+                        raise NotImplementedError("Tool not implemented in HTTP API")
+
+                    body = {"request_id": req_id, "result": result}
+                    self_inner._set_cors_headers(200)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                except FileNotFoundError as e:
+                    body = {"error": "not_found", "message": str(e), "request_id": req_id}
+                    self_inner._set_cors_headers(404)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                except PermissionError as e:
+                    body = {"error": "forbidden", "message": str(e), "request_id": req_id}
+                    self_inner._set_cors_headers(403)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                except ValueError as e:
+                    body = {"error": "bad_request", "message": str(e), "request_id": req_id}
+                    self_inner._set_cors_headers(400)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+                except Exception as e:
+                    logger.exception("Tool invocation failed")
+                    body = {"error": "internal", "message": str(e), "request_id": req_id}
+                    self_inner._set_cors_headers(500)
+                    self_inner.wfile.write(_json.dumps(body).encode("utf-8"))
+
+            def log_message(self_inner, format, *args):
+                # route to logger
+                logger.info(format % args)
+
+        class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+        srv = _ThreadingHTTPServer((host, port), _APIHandler)
+        self._api_server = srv
+
+        def _serve_api():
+            try:
+                srv.serve_forever()
+            finally:
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_serve_api, daemon=True)
+        t.start()
+        self._api_thread = t
+        logging.getLogger("GameDocServer.API").info("HTTP API started at http://%s:%s", host, port)
 
 
 async def start_server():

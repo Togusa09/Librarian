@@ -95,6 +95,61 @@ How to use
 
 - Place `copilot-mcp.json` in your project and follow GitHub Copilot/extension docs to point the extension at the MCP server or config file. The exact integration steps depend on the Copilot build and your editor — consult Copilot documentation for "MCP" or "Model Context Protocol" for details.
 
+HTTP JSON API (LLM-friendly)
+
+This server exposes a small HTTP JSON API intended for programmatic LLM tool invocations. Endpoints:
+
+- `GET /.well-known/mcp.json` — discovery; includes `base_url` and tool list.
+- `GET /healthz` — liveness probe returning `{"status":"ok"}`.
+- `GET /readyz` — readiness; currently reports whether indexing is initialized.
+- `GET /tools` — returns available tools and their simple input schemas.
+- `POST /tools/<tool_name>` — invoke a tool with a JSON body. Use `Content-Type: application/json`.
+
+Example curl commands:
+
+```bash
+# discovery + health
+curl -sS http://localhost:8001/.well-known/mcp.json
+curl -sS http://localhost:8001/healthz
+
+# tool POST examples (adjust port to the server's API port)
+curl -sS -X POST -H "Content-Type: application/json" -d '{"path":"/"}' http://localhost:8001/tools/list_files
+curl -sS -X POST -H "Content-Type: application/json" -d '{"path":"example.md"}' http://localhost:8001/tools/read_document
+curl -sS -X POST -H "Content-Type: application/json" -d '{"path":"/images/logo.png","prefer":"redirect"}' http://localhost:8001/tools/read_binary
+```
+
+Tiny OpenAPI-like fragment for tools
+
+```yaml
+openapi: 3.0.0
+info:
+	title: Librarian MCP Tools (minimal)
+	version: '0.1'
+paths:
+	/.well-known/mcp.json:
+		get: {}
+	/healthz:
+		get: {}
+	/tools:
+		get:
+			responses:
+				'200':
+					description: tool schemas
+	/tools/list_files:
+		post:
+			requestBody:
+				content:
+					application/json:
+						schema:
+							type: object
+							properties:
+								path:
+									type: string
+			responses:
+				'200':
+					description: file list
+```
+
 
 Update image locally
 
